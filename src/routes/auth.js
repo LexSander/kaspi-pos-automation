@@ -29,7 +29,7 @@ router.post('/init', async (req, res) => {
       method: 'POST',
       headers: {
         ...ENTRANCE_HEADERS_BASE,
-        Referer: `${KASPI_ENTRANCE_URL}/process/entrance/?auth=2&appBuild=${APP.build}&appVersion=${APP.version}&platformVersion=${APP.platformVer}&platformType=IOS&deviceBrand=${APP.brand}&deviceModel=${APP.model}&deviceId=${DEVICE.deviceId}&installId=${DEVICE.installId}&frontCameraAvailable=true&sf=registration&pc=KPEntrance&noPass=0`,
+        Referer: `${KASPI_ENTRANCE_URL}/process/entrance/?auth=2&appBuild=${APP.build}&appVersion=${APP.version}&platformVersion=${APP.platformVer}&platformType=IOS&deviceBrand=${APP.brand}&deviceModel=${APP.model}&deviceId=${DEVICE.deviceId}&installId=${DEVICE.installId}&frontCameraAvailable=true&sf=registration&pc=KPEntrance&noPass=${process.env.APP_NO_PASS || '0'}`,
         Cookie: entranceCookie(),
       },
       body: JSON.stringify({
@@ -47,7 +47,7 @@ router.post('/init', async (req, res) => {
           frontCameraAvailable: 'true',
           sf: 'registration',
           pc: 'KPEntrance',
-          noPass: '0',
+          noPass: process.env.APP_NO_PASS || '0',
         },
         actType: 'Success',
       }),
@@ -313,6 +313,59 @@ router.post('/session', (req, res) => {
 
 router.post('/logout', (req, res) => {
   res.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════
+//  Шаг 2а — Пароль вместо кода из SMS (KPEnterLoginPassword)
+// ═══════════════════════════════════════════════════
+
+router.post('/send-password', async (req, res) => {
+  const { password, processId, field } = req.body || {};
+  if (!password) return res.status(400).json({ error: 'password required' });
+  if (!processId) return res.status(400).json({ error: 'processId required' });
+
+  const session = authSessions.get(processId);
+  if (!session) return res.status(400).json({ error: 'Unknown processId. Call /api/auth/init first' });
+
+  const passwordField = field || process.env.APP_PASSWORD_FIELD || 'password';
+
+  try {
+    const resp = await loggedFetch(`${KASPI_ENTRANCE_URL}/api/v1/entrance/step`, {
+      method: 'POST',
+      headers: {
+        ...ENTRANCE_HEADERS_BASE,
+        Referer: `${KASPI_ENTRANCE_URL}/process/universal-enter-phone-number?pId=${session.processId}&firstPage=KPUniversalEnterPhoneNumber`,
+        Cookie: entranceCookie(session.userToken),
+      },
+      body: JSON.stringify({
+        meta: { pId: session.processId, sn: 'ViewEnterLoginPassword' },
+        data: { [passwordField]: password },
+        actType: 'Success',
+      }),
+    });
+
+    const ut = extractUserToken(resp);
+    if (ut) session.userToken = ut;
+
+    const body = await resp.json();
+    const view = body.view?.code;
+
+    // Пароль принят, дальше обычный код из SMS
+    if (view === 'EnterOtp') {
+      return res.json({ success: true, processId: session.processId, view, body });
+    }
+
+    // Устройство зарегистрировалось сразу, без кода
+    if (body.data?.type === 'kpDeviceRegistration' || view === 'KPMobileCall') {
+      const finishResult = await doFinish(session);
+      authSessions.delete(processId);
+      return res.json({ success: true, processId: session.processId, step: 'finished', ...finishResult });
+    }
+
+    res.json({ success: false, processId: session.processId, view, body });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;
