@@ -114,7 +114,7 @@ router.post('/send-phone', async (req, res) => {
 // ═══════════════════════════════════════════════════
 
 router.post('/verify-otp', async (req, res) => {
-  const { otp, processId } = req.body;
+  const { otp, processId, cashierPin } = req.body;
   if (!otp) return res.status(400).json({ error: 'otp required' });
   if (!processId) return res.status(400).json({ error: 'processId required' });
 
@@ -143,6 +143,8 @@ router.post('/verify-otp', async (req, res) => {
 
     if (body.data?.type === 'kpDeviceRegistration' || body.view?.code === 'KPMobileCall') {
       // OTP verified — automatically call finish
+      rememberAuthMethods(session, body);
+      if (cashierPin) session.cashierPin = cashierPin;
       const finishResult = await doFinish(session);
       authSessions.delete(processId);
       res.json({
@@ -165,15 +167,32 @@ router.post('/verify-otp', async (req, res) => {
 //  Finish logic (shared by verify-otp and /finish)
 // ═══════════════════════════════════════════════════
 
+// Kaspi на шаге регистрации устройства сам называет метод аутентификации:
+// у кассира это cashierpin, а не pincode. С чужим типом finish отвечает
+// «Превышено время ожидания» и требует начать регистрацию заново.
+function rememberAuthMethods(session, body) {
+  const methods = body?.data?.authMethods;
+  if (Array.isArray(methods) && methods.length) {
+    session.authMethods = methods;
+  }
+  if (typeof body?.data?.userIdHash === 'string') {
+    session.userIdHash = body.data.userIdHash;
+  }
+}
+
 async function doFinish(session) {
   const ecdhX509 = generateECDH();
   console.log('Generated ECDH public key for guard.x509:', ecdhX509);
 
+  const authType = session.authMethods?.[0]?.type || 'pincode';
+  const authValue = session.cashierPin || process.env.APP_CASHIER_PIN || '';
+  console.log(`Finish auth: type=${authType}, value=${authValue ? 'задан' : 'пустой'}`);
+
   const signedDataObj = {
     installId: DEVICE.installId,
     time: nowISO(),
-    auth: [{ value: '', type: 'pincode' }],
-    userIdHash: '',
+    auth: [{ value: authValue, type: authType }],
+    userIdHash: session.userIdHash || '',
   };
   const signedDataB64 = Buffer.from(JSON.stringify(signedDataObj)).toString('base64');
 
@@ -357,6 +376,7 @@ router.post('/send-password', async (req, res) => {
 
     // Устройство зарегистрировалось сразу, без кода
     if (body.data?.type === 'kpDeviceRegistration' || view === 'KPMobileCall') {
+      rememberAuthMethods(session, body);
       const finishResult = await doFinish(session);
       authSessions.delete(processId);
       return res.json({ success: true, processId: session.processId, step: 'finished', ...finishResult });
